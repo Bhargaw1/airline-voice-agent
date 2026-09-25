@@ -1,0 +1,8 @@
+python-dotenv==1.0.1
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pyodbc>=5.1.0
+redis>=5.0.4
+websockets==14.1
+sentence-transformers==2.5.1
+numpy>=1.26.0
