@@ -33,3 +33,6 @@ temp_*.wav
 
 # POC package output (optional local)
 AICOE_POC_Package/
+
+# Office temp lock files
+~$*
