@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airline-voice-agent"
+version = "1.0.0"
+description = "Airline voice agent FastAPI backend"
+requires-python = ">=3.10"
+
+# Runtime deps also listed in backend/requirements.txt
+dependencies = [
+  "python-dotenv>=1.0.1",
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.34.0",
+  "websockets>=14.0",
+  "pydantic>=2.0.0",
+  "pytz>=2024.1",
+  "numpy>=1.26.0",
+  "pandas>=2.0.0",
+  "sqlalchemy>=2.0.0",
+  "pyodbc>=5.1.0",
+  "openai>=1.40.0",
+  "azure-core>=1.30.0",
+  "azure-search-documents>=11.4.0",
+  "redis>=5.0.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+include = ["src*", "autogen_flow*"]

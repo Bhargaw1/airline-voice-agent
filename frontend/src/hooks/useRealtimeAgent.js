@@ -62,7 +62,15 @@ function pcm16FromBase64(base64Data) {
   return new Int16Array(bytes.buffer);
 }
 
-export function useRealtimeAgent({ onFlightResults, setStatus: reportExternalStatus, isConfigured } = {}) {
+export function useRealtimeAgent({
+  onFlightResults,
+  onSessionEnd,
+  onTurnComplete,
+  onInterrupted,
+  onInputTranscription,
+  setStatus: reportExternalStatus,
+  isConfigured
+} = {}) {
   const [status, setStatus] = useState('offline');
   const [isPlaying, setIsPlaying] = useState(false);
 
@@ -83,6 +91,16 @@ export function useRealtimeAgent({ onFlightResults, setStatus: reportExternalSta
   const reconnectAttemptsRef = useRef(0);
   const sessionHandleRef = useRef(null); 
   const goAwayTimerRef = useRef(null);
+  const onFlightResultsRef = useRef(onFlightResults);
+  const onSessionEndRef = useRef(onSessionEnd);
+
+  useEffect(() => {
+    onFlightResultsRef.current = onFlightResults;
+  }, [onFlightResults]);
+
+  useEffect(() => {
+    onSessionEndRef.current = onSessionEnd;
+  }, [onSessionEnd]);
 
   const reportStatus = useCallback(
     (message, active) => {
@@ -114,6 +132,11 @@ export function useRealtimeAgent({ onFlightResults, setStatus: reportExternalSta
       isPlayingRef.current = false;
       return;
     }
+
+    if (context.state === 'suspended') {
+      context.resume().catch((err) => console.error("Failed to resume playback context:", err));
+    }
+
     setIsPlaying(true);
     isPlayingRef.current = true;
 
@@ -129,7 +152,10 @@ export function useRealtimeAgent({ onFlightResults, setStatus: reportExternalSta
     source.buffer = buffer;
     source.connect(context.destination);
 
-    const startTime = Math.max(context.currentTime, nextStartTimeRef.current);
+    let startTime = Math.max(context.currentTime, nextStartTimeRef.current);
+    if (nextStartTimeRef.current - context.currentTime > 1.0) {
+      startTime = context.currentTime;
+    }
     source.start(startTime);
     nextStartTimeRef.current = startTime + buffer.duration;
 
@@ -268,35 +294,84 @@ export function useRealtimeAgent({ onFlightResults, setStatus: reportExternalSta
           if (sessionHandleRef.current) sendSetup(ws);
         };
 
-        ws.onmessage = (event) => {
+        ws.onmessage = async (event) => {
           try {
-            const text = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
+            let text;
+            if (typeof event.data === 'string') {
+              text = event.data;
+            } else if (event.data instanceof Blob) {
+              text = await event.data.text();
+            } else {
+              text = new TextDecoder().decode(event.data);
+            }
             const msg = JSON.parse(text);
 
             if (msg.setupComplete) {
               setupCompleteRef.current = true;
               setStatus('online');
               reportStatus('Agent Online', true);
-              return;
-            }
-
-            if (msg.toolResult) {
-              if (typeof onFlightResults === 'function') {
-                onFlightResults(msg.toolResult.data, msg.toolResult.name);
+              if (playbackContextRef.current && playbackContextRef.current.state === 'suspended') {
+                playbackContextRef.current.resume().catch((e) => console.warn("Failed to resume setup complete:", e));
               }
               return;
             }
 
-            if (msg.serverContent?.interrupted) {
-              stopAllPlayback();
+            if (msg.toolStatus) {
+              if (playbackContextRef.current && playbackContextRef.current.state === 'suspended') {
+                playbackContextRef.current.resume().catch((e) => console.warn("Failed to resume on tool status:", e));
+              }
               return;
             }
 
-            if (msg.serverContent?.modelTurn?.parts) {
-              for (const part of msg.serverContent.modelTurn.parts) {
-                if (part.inlineData?.data) {
-                  playbackQueueRef.current.push(part.inlineData.data);
-                  if (!isPlayingRef.current) playNextChunk();
+            if (msg.toolResult) {
+              if (playbackContextRef.current && playbackContextRef.current.state === 'suspended') {
+                playbackContextRef.current.resume().catch((e) => console.warn("Failed to resume on tool result:", e));
+              }
+              const data = msg.toolResult.data;
+              const rows = data?.flight_results;
+              const handler = onFlightResultsRef.current;
+              if (Array.isArray(rows) && rows.length > 0 && typeof handler === 'function') {
+                handler(rows, {
+                  count: data?.count ?? rows.length,
+                  truncated: data?.truncated,
+                  widened: data?.widened,
+                });
+              }
+              return;
+            }
+
+            const serverContent = msg.serverContent;
+            if (serverContent) {
+              if (serverContent.interrupted) {
+                stopAllPlayback();
+                if (typeof onInterrupted === 'function') onInterrupted();
+              }
+              if (serverContent.turnComplete) {
+                if (typeof onTurnComplete === 'function') onTurnComplete();
+              }
+              if (serverContent.inputTranscription?.text) {
+                if (typeof onInputTranscription === 'function') {
+                  onInputTranscription(serverContent.inputTranscription.text);
+                }
+              }
+              if (serverContent.modelTurn?.parts) {
+                for (const part of serverContent.modelTurn.parts) {
+                  if (part.inlineData?.data) {
+                    playbackQueueRef.current.push(part.inlineData.data);
+                    if (!isPlayingRef.current) {
+                      const context = playbackContextRef.current;
+                      if (context && context.state === 'suspended') {
+                        context.resume()
+                          .then(() => playNextChunk())
+                          .catch((err) => {
+                            console.error("Failed to resume context on modelTurn:", err);
+                            playNextChunk();
+                          });
+                      } else {
+                        playNextChunk();
+                      }
+                    }
+                  }
                 }
               }
               return;
@@ -326,6 +401,9 @@ export function useRealtimeAgent({ onFlightResults, setStatus: reportExternalSta
         ws.onclose = (event) => {
           setupCompleteRef.current = false;
           cleanupAudioGraph();
+          if (manualStopRef.current && typeof onSessionEndRef.current === 'function') {
+            onSessionEndRef.current();
+          }
           if (manualStopRef.current || event.code === 1000) {
             setStatus('offline');
             reportStatus('Agent Offline', false);
@@ -376,7 +454,7 @@ export function useRealtimeAgent({ onFlightResults, setStatus: reportExternalSta
         reportStatus(message, false);
       }
     },
-    [status, isConfigured, reportStatus, playNextChunk, onFlightResults, cleanupAudioGraph, scheduleReconnect, sendSetup, stopAllPlayback]
+    [status, isConfigured, reportStatus, playNextChunk, cleanupAudioGraph, scheduleReconnect, sendSetup, stopAllPlayback]
   );
 
   useEffect(() => {
