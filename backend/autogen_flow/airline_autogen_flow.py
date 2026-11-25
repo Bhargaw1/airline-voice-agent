@@ -11,6 +11,7 @@ import json
 import time
 import logging
 import pandas as pd
+from typing import Optional
 from sqlalchemy import text
 from openai import AzureOpenAI, BadRequestError
 
@@ -24,6 +25,17 @@ MODEL = GPT4_LLM_MODEL_DEPLOYMENT_NAME
 EFFORT = os.getenv("SQL_FLOW_REASONING_EFFORT", "minimal")
 MAX_ROWS = int(os.getenv("SQL_FLOW_MAX_ROWS", "50"))
 SCHEMA_TTL = 600
+VOICE_FAST = os.getenv("SQL_VOICE_FAST", "true").lower() in ("1", "true", "yes")
+ZERO_ROW_RETRY = os.getenv("SQL_FLOW_ZERO_ROW_RETRY", "false").lower() in ("1", "true", "yes")
+LIGHT_SCHEMA = os.getenv("SQL_LIGHT_SCHEMA", "true").lower() in ("1", "true", "yes")
+FLIGHT_CACHE_TTL = float(os.getenv("FLIGHT_CACHE_TTL_SECONDS", "60"))
+_FLIGHT_CACHE: dict[str, tuple[float, list, str]] = {}
+
+_FLIGHT_COLS = (
+    "flight_number, airline, origin, destination, flight_date, departure_time, arrival_time, "
+    "flight_status, booking_status, available_seats, total_fare_inr, currency"
+)
+_IST_TODAY = "CAST(SYSDATETIMEOFFSET() AT TIME ZONE 'India Standard Time' AS DATE)"
 
 _client = AzureOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
@@ -66,6 +78,100 @@ _FORBIDDEN = re.compile(
 
 _schema = {"text": None, "at": 0.0}
 
+def _sql_lit(value: str) -> str:
+    return (value or "").replace("'", "''")
+
+
+def resolve_iata(value: str) -> Optional[str]:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if re.match(r"^[A-Za-z]{3}$", raw):
+        return raw.upper()
+    return AIRPORT_ALIASES.get(raw.lower())
+
+
+def build_fast_search_sql(
+    origin: str,
+    destination: str,
+    date: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> Optional[str]:
+    """Deterministic BLR→DEL-style lookup without an LLM round-trip."""
+    o, d = resolve_iata(origin), resolve_iata(destination)
+    if not o or not d:
+        return None
+    clauses = [
+        f"origin = '{_sql_lit(o)}'",
+        f"destination = '{_sql_lit(d)}'",
+        "flight_status != 'Cancelled'",
+        f"flight_date >= {_IST_TODAY}",
+    ]
+    if date:
+        clauses.append(f"flight_date = '{_sql_lit(str(date))}'")
+    elif date_from and date_to:
+        clauses.append(f"flight_date >= '{_sql_lit(str(date_from))}'")
+        clauses.append(f"flight_date <= '{_sql_lit(str(date_to))}'")
+    where = " AND ".join(clauses)
+    return (
+        f"SELECT TOP {MAX_ROWS} {_FLIGHT_COLS} FROM {TABLE} WHERE {where} "
+        "ORDER BY flight_date ASC, departure_time ASC"
+    )
+
+
+def build_fast_status_sql(flight_no: str, date: Optional[str] = None) -> Optional[str]:
+    if not flight_no:
+        return None
+    fn = _sql_lit(str(flight_no).strip().upper())
+    clauses = [f"UPPER(flight_number) LIKE '%{fn}%'", "flight_status != 'Cancelled'"]
+    if date and str(date).strip().lower() not in ("", "today"):
+        clauses.append(f"flight_date = '{_sql_lit(str(date))}'")
+    else:
+        clauses.append(f"flight_date >= {_IST_TODAY}")
+    where = " AND ".join(clauses)
+    return (
+        f"SELECT TOP {MAX_ROWS} {_FLIGHT_COLS} FROM {TABLE} WHERE {where} "
+        "ORDER BY flight_date ASC, departure_time ASC"
+    )
+
+
+def flight_search_cache_key(args: dict) -> str:
+    parts = (
+        "search",
+        (args.get("origin") or "").strip().lower(),
+        (args.get("destination") or "").strip().lower(),
+        (args.get("date") or "").strip(),
+        (args.get("date_from") or "").strip(),
+        (args.get("date_to") or "").strip(),
+    )
+    return "|".join(parts)
+
+
+def flight_status_cache_key(args: dict) -> str:
+    return "|".join(
+        ("status", (args.get("flight_no") or "").strip().upper(), (args.get("date") or "").strip())
+    )
+
+
+def _flight_cache_get(key: str) -> Optional[tuple[list, str]]:
+    if not key:
+        return None
+    hit = _FLIGHT_CACHE.get(key)
+    if not hit:
+        return None
+    ts, rows, sql = hit
+    if time.time() - ts > FLIGHT_CACHE_TTL:
+        _FLIGHT_CACHE.pop(key, None)
+        return None
+    return rows, sql
+
+
+def _flight_cache_set(key: str, rows: list, sql: str) -> None:
+    if key and rows is not None:
+        _FLIGHT_CACHE[key] = (time.time(), rows, sql)
+
+
 def get_schema_context() -> str:
     """Columns + real distinct values, read from the DB (cached)."""
     if _schema["text"] and time.time() - _schema["at"] < SCHEMA_TTL:
@@ -76,28 +182,34 @@ def get_schema_context() -> str:
             "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='voice_agent_data' ORDER BY ORDINAL_POSITION"), engine)
         col_txt = ", ".join(f"{r.COLUMN_NAME} ({r.DATA_TYPE})" for r in cols.itertuples())
 
-        def distinct(col):
-            df = pd.read_sql(text(f"SELECT DISTINCT {col} AS v FROM {TABLE} WHERE {col} IS NOT NULL"), engine)
-            return sorted(str(v) for v in df["v"].tolist())[:20]
-
-        rng = pd.read_sql(text(f"SELECT MIN(flight_date) AS lo, MAX(flight_date) AS hi FROM {TABLE}"), engine)
-        lo, hi = rng["lo"][0], rng["hi"][0]
-
         grouped = {}
         for alias, code in AIRPORT_ALIASES.items():
             if alias.lower() != code.lower():
                 grouped.setdefault(code, []).append(alias.title())
         alias_txt = "\n".join(f"- {c}: {', '.join(n)}" for c, n in sorted(grouped.items()))
 
-        ctx = (
-            f"Database: Azure SQL (T-SQL). Single table: {TABLE}\n"
-            f"Columns: {col_txt}\n"
-            f"Data date range: {lo if not pd.isna(lo) else 'N/A'} to {hi if not pd.isna(hi) else 'N/A'}\n"
-            f"origin values in DB: {', '.join(distinct('origin'))}\n"
-            f"destination values in DB: {', '.join(distinct('destination'))}\n"
-            f"flight_status values: {', '.join(distinct('flight_status'))}\n"
-            f"City aliases (user may say these; DB holds the codes):\n{alias_txt}"
-        )
+        if LIGHT_SCHEMA:
+            ctx = (
+                f"Database: Azure SQL (T-SQL). Single table: {TABLE}\n"
+                f"Columns: {col_txt}\n"
+                f"City aliases (user may say these; DB holds IATA codes):\n{alias_txt}"
+            )
+        else:
+            def distinct(col):
+                df = pd.read_sql(text(f"SELECT DISTINCT {col} AS v FROM {TABLE} WHERE {col} IS NOT NULL"), engine)
+                return sorted(str(v) for v in df["v"].tolist())[:20]
+
+            rng = pd.read_sql(text(f"SELECT MIN(flight_date) AS lo, MAX(flight_date) AS hi FROM {TABLE}"), engine)
+            lo, hi = rng["lo"][0], rng["hi"][0]
+            ctx = (
+                f"Database: Azure SQL (T-SQL). Single table: {TABLE}\n"
+                f"Columns: {col_txt}\n"
+                f"Data date range: {lo if not pd.isna(lo) else 'N/A'} to {hi if not pd.isna(hi) else 'N/A'}\n"
+                f"origin values in DB: {', '.join(distinct('origin'))}\n"
+                f"destination values in DB: {', '.join(distinct('destination'))}\n"
+                f"flight_status values: {', '.join(distinct('flight_status'))}\n"
+                f"City aliases (user may say these; DB holds the codes):\n{alias_txt}"
+            )
         _schema.update(text=ctx, at=time.time())
         return ctx
     except Exception as e:
@@ -225,12 +337,17 @@ Formatting Rules:
     # Send up to 25 rows instead of just 10 so LLM has the full schedule context
     return _llm(system, f"Question: {question}\nRows ({len(rows)}): {json.dumps(rows[:25])}")
 
-def run_sql_pipeline(question: str) -> dict:
-    """
-    Pure SQL Pipeline. Only executes tabular lookup.
-    Caps retries at at most 1 attempt to avoid 50s timeouts.
-    """
+def run_sql_pipeline(
+    question: str,
+    *,
+    voice_mode: bool = False,
+    fast_sql: Optional[str] = None,
+    cache_key: Optional[str] = None,
+) -> dict:
+    """Pure SQL pipeline. Voice mode skips answer LLM and uses fast SQL / cache when possible."""
     t0 = time.perf_counter()
+    voice = voice_mode or VOICE_FAST
+    skip_answer = voice
     fallback_res = {
         "query": "",
         "rows": [],
@@ -240,38 +357,74 @@ def run_sql_pipeline(question: str) -> dict:
         "timings": {"sql_pipeline": 0.0},
     }
 
-    try:
-        sql = generate_sql(question)
-        rows, err = execute_query(sql)
+    cached = _flight_cache_get(cache_key) if cache_key else None
+    if cached:
+        rows, sql = cached
+        timings = {"sql_pipeline": round(time.perf_counter() - t0, 3)}
+        logger.info(f"⏱️ SQL cache hit ({len(rows)} rows) in {timings['sql_pipeline']}s")
+        return {
+            "query": sql,
+            "rows": rows[:25],
+            "count": len(rows),
+            "answer": "",
+            "error": None,
+            "timings": timings,
+        }
 
-        if err:  # At most 1 self-repair attempt
-            sql = generate_sql(question, feedback=f"{err}\nSQL was: {sql}")
+    try:
+        used_fast = False
+        if fast_sql:
+            sql = fast_sql
             rows, err = execute_query(sql)
-        elif not rows:  # At most 1 widen-date attempt
-            sql2 = generate_sql(question, feedback=("Returned 0 rows. Rewrite to return nearest available dates."))
-            rows2, err2 = execute_query(sql2)
-            if rows2 and not err2: sql, rows = sql2, rows2
+            used_fast = True
+            if err:
+                sql = generate_sql(question)
+                rows, err = execute_query(sql)
+                used_fast = False
+            elif not rows and voice and not ZERO_ROW_RETRY:
+                pass
+            elif not rows and (not voice or ZERO_ROW_RETRY):
+                sql2 = generate_sql(question, feedback="Returned 0 rows. Rewrite to return nearest available dates.")
+                rows2, err2 = execute_query(sql2)
+                if rows2 and not err2:
+                    sql, rows = sql2, rows2
+        else:
+            sql = generate_sql(question)
+            rows, err = execute_query(sql)
+
+            if err:
+                sql = generate_sql(question, feedback=f"{err}\nSQL was: {sql}")
+                rows, err = execute_query(sql)
+            elif not rows and ZERO_ROW_RETRY:
+                sql2 = generate_sql(question, feedback="Returned 0 rows. Rewrite to return nearest available dates.")
+                rows2, err2 = execute_query(sql2)
+                if rows2 and not err2:
+                    sql, rows = sql2, rows2
 
         if err:
             return {
                 "query": sql,
                 "rows": [],
                 "count": 0,
-                "answer": "Could not retrieve flight schedules at this moment due to a database timeout. Please try again.",
+                "answer": fallback_res["answer"] if not skip_answer else "",
                 "error": err,
                 "timings": {"sql_pipeline": round(time.perf_counter() - t0, 2)},
             }
 
-        answer = generate_answer(question, rows)
+        answer = "" if skip_answer else generate_answer(question, rows)
         timings = {"sql_pipeline": round(time.perf_counter() - t0, 2)}
-        logger.info(f"⏱️ SQL execution finished in {timings['sql_pipeline']}s")
+        path = "fast_sql" if used_fast else "llm_sql"
+        logger.info(f"⏱️ SQL pipeline ({path}) finished in {timings['sql_pipeline']}s")
+
+        if cache_key and rows:
+            _flight_cache_set(cache_key, rows, sql)
 
         return {
             "query": sql,
-            "rows": rows[:25],  # Up to 25 rows context
+            "rows": rows[:25],
             "count": len(rows),
             "answer": answer,
-            "error": err,
+            "error": None,
             "timings": timings,
         }
     except Exception as e:

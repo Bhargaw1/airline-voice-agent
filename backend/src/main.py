@@ -843,9 +843,18 @@ async def _send_client_tool_result(websocket: WebSocket, fc: Dict[str, Any], res
 # Reminder attached to EVERY tool response so the model keeps speaking in the user's current language
 # (tool data / policy text is usually English and used to pull the model into drifting languages).
 LANGUAGE_REMINDER = (
-    "Speak your reply in the SAME language the user is currently speaking. "
-    "Do NOT switch language because this data is in English or another language. "
-    "Translate/paraphrase it into the user's current language. Keep it to 2-3 short sentences."
+    "Speak your entire reply in the SAME language (and script/register) the user is currently using in their "
+    "latest spoken message — any language Gemini understands (e.g. English, Hindi, Tamil, Telugu, Bengali, "
+    "Marathi, Arabic, Spanish, French, Japanese, etc.). "
+    "Do NOT switch language because tool output or policy text is in English. Translate/paraphrase into the "
+    "user's current language. Never say you only support English, Hindi, or Hinglish. "
+    "Keep it to 2-3 short sentences."
+)
+
+# Semantic meaning for booking handoff (tool text is English; model must speak it in the user's language).
+BOOKING_HANDOFF_MEANING = (
+    "For further booking process, I am forwarding your request to my team member. "
+    "They will assist you with documentation and payment shortly."
 )
 
 _INJECTION_PATTERNS = [
@@ -857,15 +866,6 @@ _INJECTION_PATTERNS = [
         r"jailbreak",
     )
 ]
-
-# Heuristic for detecting Hindi / Hinglish in the user's utterance (used for the handoff summary text).
-# Word-boundary matching avoids false positives like "chair" / "hair" matching "hai".
-_HINDI_PATTERN = re.compile(
-    r"[\u0900-\u097F]|\b(hai|hain|karna|karni|karo|kijiye|chahiye|mujhe|madad|kripya|aap|mera|meri|"
-    r"hamare|kya|kaise|kab|kahan|nahi|haan|batao|dikhao|bukk?ing)\b",
-    re.IGNORECASE,
-)
-
 
 def tool_args_violation(args: Dict[str, Any]) -> Optional[str]:
     for key, value in (args or {}).items():
@@ -935,19 +935,21 @@ def build_setup_message(resume_handle: Optional[str] = None) -> dict:
                         f"You are Sky, a highly professional airline concierge. Current local time is {time_context} "
                         f"and today's date is {date_context} (India Standard Time).\n\n"
                         "CORE SYSTEM BEHAVIOR & PRIORITIES:\n\n"
-                        "1. LANGUAGE LOCK (HIGHEST PRIORITY - OVERRIDES EVERYTHING ELSE):\n"
-                        "   - Your conversation language starts as ENGLISH.\n"
-                        "   - Detect the language of the user's LATEST spoken message and reply ONLY in that language.\n"
-                        "   - STAY in the current language for every following turn. Do NOT switch languages on your own, "
-                        "even if tool results, flight data, policy text, or earlier messages contain another language, "
-                        "and even if the user's message contains a few words of another language "
-                        "(e.g. one Hindi word or a name inside an English sentence).\n"
-                        "   - Switch ONLY when the user clearly speaks a full sentence or request in a different language, "
-                        "or explicitly asks you to change language. Once they switch, stay in the new language until they switch again.\n"
-                        "   - English sentence = English reply. Hindi sentence = Hindi reply. "
-                        "Hinglish (Hindi in Roman script) sentence = Hinglish reply.\n"
-                        "   - Tool outputs are usually in English; always paraphrase them into the user's CURRENT language when speaking.\n"
-                        "   - Keep all voice responses concise, conversational, and direct (2-3 sentences max).\n\n"
+                        "1. UNIVERSAL LANGUAGE MIRRORING (HIGHEST PRIORITY — OVERRIDES EVERYTHING ELSE):\n"
+                        "   - You are a multilingual voice assistant powered by Gemini. Support EVERY language the user "
+                        "can speak that Gemini understands — not only English, Hindi, or Hinglish.\n"
+                        "   - NEVER tell the user you are limited to English, Hindi, or Hinglish.\n"
+                        "   - Detect the language (and script/register, e.g. Tamil vs Hindi, formal vs casual) of the "
+                        "user's LATEST spoken message and reply ONLY in that same language.\n"
+                        "   - STAY in that language until the user clearly switches (full sentence in another language "
+                        "or an explicit request to change language).\n"
+                        "   - Do NOT drift because tool results, flight rows, or policy excerpts are in English — "
+                        "always paraphrase into the user's CURRENT spoken language.\n"
+                        "   - If the user mixes languages in one utterance, mirror their dominant style (e.g. Hinglish "
+                        "if they mix Hindi and English in Roman script).\n"
+                        "   - Before the user speaks, you may use a brief neutral English greeting only; "
+                        "from their first spoken message onward, mirror their language exclusively.\n"
+                        "   - Keep voice responses concise, conversational, and direct (2-3 sentences max).\n\n"
                         "2. FLIGHT SEARCH PRIORITY:\n"
                         "   - When the user asks for flights, schedules, fares, or routes, you MUST ALWAYS call the `search_flights` tool. NEVER answer flight availability or schedules from memory.\n"
                         "   - For specific flight number inquiry or status, call `get_flight_status`.\n"
@@ -960,10 +962,10 @@ def build_setup_message(resume_handle: Optional[str] = None) -> dict:
                         "   - When the user indicates they want to BOOK or RESERVE a flight (e.g., 'Mujhe flight book karni hai', 'Book this flight', 'Reserve seat'):\n"
                         "     Do NOT ask multi-step questions for passenger count, meals, or medical conditions.\n"
                         "     Immediately call the `initiate_booking_handoff` tool.\n"
-                        "     Then speak the handoff message in the user's CURRENT conversation language (per the Language Lock above), meaning exactly this:\n"
-                        "     - English: 'For further booking process, I am forwarding your request to my team member. They will assist you with documentation and payment shortly.'\n"
-                        "     - Hindi / Hinglish: 'Aage ki booking process ke liye main aapki request hamare team member ko forward kar raha hoon. Wo jald hi documentation aur payment mein aapki madad karenge.'\n"
-                        "     Use the Hindi/Hinglish version ONLY if the user is currently speaking Hindi/Hinglish. Otherwise use the English version.\n"
+                        "     Then speak the handoff message in the user's CURRENT spoken language, with this meaning "
+                        "(translate naturally — do not read English verbatim unless the user is speaking English):\n"
+                        "     'For further booking process, I am forwarding your request to my team member. "
+                        "They will assist you with documentation and payment shortly.'\n"
                     )
                 }]
             },
@@ -1044,12 +1046,23 @@ except ImportError as e:
     AirlineMiddleware = None
 
 try:
-    from autogen_flow.airline_autogen_flow import route_question, run_sql_pipeline, warm_up, db_healthy
+    from autogen_flow.airline_autogen_flow import (
+        route_question,
+        run_sql_pipeline,
+        warm_up,
+        db_healthy,
+        build_fast_search_sql,
+        build_fast_status_sql,
+        flight_search_cache_key,
+        flight_status_cache_key,
+    )
     FLOW_AVAILABLE = True
 except Exception as e:
     logger.error(f"❌ SQL flow import failed (all flight tools will return 503): {e}", exc_info=True)
     FLOW_AVAILABLE = False
     route_question = run_sql_pipeline = warm_up = db_healthy = None
+    build_fast_search_sql = build_fast_status_sql = None
+    flight_search_cache_key = flight_status_cache_key = None
 
 
 @asynccontextmanager
@@ -1343,8 +1356,31 @@ async def _gateway_router_flow(tool: str, args: Dict[str, Any], tool_question: s
 
     # Bypass router LLM for deterministic flight tools to save ~2.5s latency
     if tool in ("search_flights", "get_flight_status"):
-        logger.info(f"🚦 Direct SQL route for tool={tool} utterance={utterance!r}")
-        sql_result = await asyncio.to_thread(run_sql_pipeline, tool_question)
+        fast_sql = cache_key = None
+        if tool == "search_flights":
+            fast_sql = build_fast_search_sql(
+                args.get("origin"),
+                args.get("destination"),
+                args.get("date"),
+                args.get("date_from"),
+                args.get("date_to"),
+            )
+            cache_key = flight_search_cache_key(args)
+        elif tool == "get_flight_status":
+            fast_sql = build_fast_status_sql(args.get("flight_no"), args.get("date"))
+            cache_key = flight_status_cache_key(args)
+
+        logger.info(
+            f"🚦 Direct SQL route for tool={tool} fast_sql={'yes' if fast_sql else 'llm'} "
+            f"question={tool_question!r}"
+        )
+        sql_result = await asyncio.to_thread(
+            run_sql_pipeline,
+            tool_question,
+            voice_mode=True,
+            fast_sql=fast_sql,
+            cache_key=cache_key,
+        )
         return _build_flight_payload("sql", sql_result, None)
 
     category = args.get("category")
@@ -1398,22 +1434,23 @@ async def execute_flight_status(args: Dict[str, Any], utterance: str = "") -> Di
     return await _gateway_router_flow("get_flight_status", args, question, utterance)
 
 
+def _flight_search_question(args: Dict[str, Any]) -> str:
+    origin, destination = args.get("origin"), args.get("destination")
+    date_from, date_to, date = args.get("date_from"), args.get("date_to"), args.get("date")
+    if date_from and date_to:
+        return f"Find available flights from {origin} to {destination} between {date_from} and {date_to}."
+    if date:
+        return f"Find available flights from {origin} to {destination} on {date}."
+    return f"Find upcoming flights from {origin} to {destination}."
+
+
 async def execute_flight_search(args: Dict[str, Any], utterance: str = "") -> Dict[str, Any]:
     origin, destination = args.get("origin"), args.get("destination")
     if not all([origin, destination]):
         raise HTTPException(status_code=400, detail="origin and destination required")
 
-    # Prioritize raw utterance to preserve natural language context
-    if utterance:
-        question = utterance
-    else:
-        date_from, date_to, date = args.get("date_from"), args.get("date_to"), args.get("date")
-        if date_from and date_to:
-            question = f"Find all available flights from {origin} to {destination} between {date_from} and {date_to}."
-        elif date:
-            question = f"Find all available flights from {origin} to {destination} on {date}."
-        else:
-            question = f"Find upcoming flights from {origin} to {destination}."
+    # Structured tool args beat noisy ASR utterance for SQL speed and accuracy.
+    question = _flight_search_question(args)
 
     return await _gateway_router_flow("search_flights", args, question, utterance)
 
@@ -1439,20 +1476,11 @@ async def execute_tool_call(name: str, args: Dict[str, Any], utterance: str = ""
             # Fire-and-forget email dispatch
             asyncio.create_task(send_booking_email_async(args, utterance, history or []))
 
-            # Language heuristic for the handoff message (word-boundary match, no substring false positives)
-            is_hindi = bool(_HINDI_PATTERN.search(utterance or ""))
-            response_text = (
-                "Aage ki booking process ke liye main aapki request hamare team member ko forward kar raha hoon. "
-                "Wo jald hi documentation aur payment mein aapki madad karenge." if is_hindi else
-                "For further booking process, I am forwarding your request to my team member. "
-                "They will assist you with documentation and payment shortly."
-            )
-
             return {
                 "route": "handoff",
                 "status": "forwarded",
                 "message": "Request forwarded to support team (i-shyam.singh@affine.ai)",
-                "summary": response_text
+                "summary": BOOKING_HANDOFF_MEANING,
             }
         return {"error": f"Unknown tool: {name}"}
     except Exception as e:
@@ -1470,6 +1498,43 @@ async def _run_tool_with_timeout(fc: Dict[str, Any], utterance: str = "", histor
         logger.error(f"❌ Tool '{name}' timed out after {TOOL_TIMEOUT_SECONDS}s")
         result = {"error": "The lookup is taking too long. Please try again in a moment."}
     return fc, result
+
+
+def _tool_dedupe_key(fc: Dict[str, Any]) -> tuple:
+    name = fc.get("name") or ""
+    args = fc.get("args") or {}
+    if name == "search_flights":
+        return (
+            name,
+            (args.get("origin") or "").strip().lower(),
+            (args.get("destination") or "").strip().lower(),
+            (args.get("date") or "").strip(),
+            (args.get("date_from") or "").strip(),
+            (args.get("date_to") or "").strip(),
+        )
+    if name == "get_flight_status":
+        return (name, (args.get("flight_no") or "").strip().upper(), (args.get("date") or "").strip())
+    return (name, fc.get("id") or id(fc))
+
+
+async def _run_tool_calls_deduped(function_calls: list, utterance: str, history: list) -> list:
+    """Run parallel tool calls but execute identical flight lookups only once."""
+    key_to_fc: Dict[tuple, Dict[str, Any]] = {}
+    for fc in function_calls:
+        key_to_fc.setdefault(_tool_dedupe_key(fc), fc)
+
+    key_results: Dict[tuple, tuple] = {}
+    if key_to_fc:
+        gathered = await asyncio.gather(
+            *[_run_tool_with_timeout(fc, utterance, history) for fc in key_to_fc.values()]
+        )
+        for fc, result in gathered:
+            key_results[_tool_dedupe_key(fc)] = (fc, result)
+
+    out: list = []
+    for fc in function_calls:
+        out.append(key_results[_tool_dedupe_key(fc)])
+    return out
 
 
 # ==============================================================================
@@ -1525,7 +1590,20 @@ async def relay_gemini_to_client(websocket: WebSocket, gemini_ws, session_key: O
                 if not greeting_triggered:
                     greeting_triggered = True
                     await gemini_ws.send(json.dumps({
-                        "clientContent": {"turns": [{"role": "user", "parts": [{"text": "Hi. Greet me politely in English."}]}], "turnComplete": True}
+                        "clientContent": {
+                            "turns": [{
+                                "role": "user",
+                                "parts": [{
+                                    "text": (
+                                        "You are live with a customer. Greet them briefly as Sky, the airline concierge. "
+                                        "Use a short neutral English greeting only until they speak; as soon as you hear "
+                                        "their language, mirror that language for every following reply. "
+                                        "Never claim you only support English, Hindi, or Hinglish."
+                                    ),
+                                }],
+                            }],
+                            "turnComplete": True,
+                        }
                     }))
                     logger.info("👋 Sent kickoff turn so Gemini greets the customer first")
                     setup_done.set()
@@ -1537,7 +1615,7 @@ async def relay_gemini_to_client(websocket: WebSocket, gemini_ws, session_key: O
                         await websocket.send_json({"toolStatus": {"name": fc.get("name"), "state": "started"}})
                 utterance = _clean_utterance(ctx.get("utterance"))
                 history = ctx.get("history", [])
-                results = await asyncio.gather(*[_run_tool_with_timeout(fc, utterance, history) for fc in function_calls])
+                results = await _run_tool_calls_deduped(function_calls, utterance, history)
                 responses = []
                 for fc, result in results:
                     if isinstance(result, dict):
